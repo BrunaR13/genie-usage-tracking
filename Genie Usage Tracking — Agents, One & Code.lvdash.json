@@ -1,0 +1,1085 @@
+{
+  "datasets": [
+    {
+      "name": "genie_usage_by_user_month",
+      "displayName": "genie_usage_by_user_month",
+      "queryLines": [
+        "SELECT\n",
+        "  u.identity_metadata.run_as AS user,\n",
+        "  u.usage_metadata.genie.surface AS genie_surface,\n",
+        "  SUM(\n",
+        "    CASE\n",
+        "      WHEN u.sku_name = 'GENIE_FREE_USAGE' THEN u.usage_quantity\n",
+        "      ELSE 0\n",
+        "    END\n",
+        "  ) AS free_dbus,\n",
+        "  SUM(\n",
+        "    CASE\n",
+        "      WHEN u.sku_name != 'GENIE_FREE_USAGE' THEN u.usage_quantity\n",
+        "      ELSE 0\n",
+        "    END\n",
+        "  ) AS paid_dbus,\n",
+        "  SUM(\n",
+        "    CASE\n",
+        "      WHEN\n",
+        "        u.sku_name != 'GENIE_FREE_USAGE'\n",
+        "      THEN\n",
+        "        u.usage_quantity * lp.pricing.effective_list.default\n",
+        "      ELSE 0\n",
+        "    END\n",
+        "  ) AS paid_cost\n",
+        "FROM\n",
+        "  system.billing.usage u\n",
+        "    LEFT JOIN system.billing.list_prices lp\n",
+        "      ON u.sku_name = lp.sku_name\n",
+        "      AND u.usage_end_time >= lp.price_start_time\n",
+        "      AND (\n",
+        "        lp.price_end_time IS NULL\n",
+        "        OR u.usage_end_time < lp.price_end_time\n",
+        "      )\n",
+        "WHERE\n",
+        "  u.billing_origin_product = 'GENIE'\n",
+        "  AND u.usage_date >= DATE_TRUNC('MONTH', CURRENT_DATE)\n",
+        "GROUP BY\n",
+        "  u.identity_metadata.run_as,\n",
+        "  u.usage_metadata.genie.surface\n",
+        "ORDER BY\n",
+        "  user,\n",
+        "  genie_surface"
+      ]
+    },
+    {
+      "name": "genie_free_usage_estimated_cost",
+      "displayName": "genie_free_usage_estimated_cost",
+      "queryLines": [
+        "WITH free_usage AS (\n",
+        "  SELECT\n",
+        "    account_id,\n",
+        "    workspace_id,\n",
+        "    identity_metadata.run_as AS run_as,\n",
+        "    usage_metadata.genie.surface AS genie_surface,\n",
+        "    usage_quantity,\n",
+        "    usage_end_time\n",
+        "  FROM\n",
+        "    system.billing.usage\n",
+        "  WHERE\n",
+        "    billing_origin_product = 'GENIE'\n",
+        "    AND sku_name = 'GENIE_FREE_USAGE'\n",
+        "    AND usage_date >= DATE_TRUNC('MONTH', CURRENT_DATE)\n",
+        "),\n",
+        "latest_real_sku AS (\n",
+        "  SELECT\n",
+        "    workspace_id,\n",
+        "    max_by(sku_name, usage_start_time) AS proxy_sku_name\n",
+        "  FROM\n",
+        "    system.billing.usage\n",
+        "  WHERE\n",
+        "    billing_origin_product = 'GENIE'\n",
+        "    AND sku_name != 'GENIE_FREE_USAGE'\n",
+        "    AND usage_date >= CURRENT_DATE - 30\n",
+        "  GROUP BY\n",
+        "    workspace_id\n",
+        "),\n",
+        "resolved AS (\n",
+        "  SELECT\n",
+        "    f.account_id,\n",
+        "    f.workspace_id,\n",
+        "    f.run_as,\n",
+        "    f.genie_surface,\n",
+        "    f.usage_quantity,\n",
+        "    f.usage_end_time,\n",
+        "    r.proxy_sku_name AS pricing_sku_name\n",
+        "  FROM\n",
+        "    free_usage f\n",
+        "      LEFT JOIN latest_real_sku r\n",
+        "        ON f.workspace_id = r.workspace_id\n",
+        "),\n",
+        "priced AS (\n",
+        "  SELECT\n",
+        "    r.account_id,\n",
+        "    r.workspace_id,\n",
+        "    r.run_as AS user,\n",
+        "    r.genie_surface,\n",
+        "    r.usage_quantity,\n",
+        "    lp.pricing.effective_list.default AS list_price_per_unit,\n",
+        "    r.usage_quantity * lp.pricing.effective_list.default * 0.75 AS estimated_list_cost\n",
+        "  FROM\n",
+        "    resolved r\n",
+        "      LEFT JOIN system.billing.list_prices lp\n",
+        "        ON r.pricing_sku_name = lp.sku_name\n",
+        "        AND r.usage_end_time >= lp.price_start_time\n",
+        "        AND (\n",
+        "          lp.price_end_time IS NULL\n",
+        "          OR r.usage_end_time < lp.price_end_time\n",
+        "        )\n",
+        ")\n",
+        "SELECT\n",
+        "  account_id,\n",
+        "  workspace_id,\n",
+        "  user,\n",
+        "  genie_surface,\n",
+        "  SUM(usage_quantity) AS total_dbus,\n",
+        "  list_price_per_unit,\n",
+        "  SUM(estimated_list_cost) AS total_estimated_list_cost\n",
+        "FROM\n",
+        "  priced\n",
+        "GROUP BY\n",
+        "  account_id,\n",
+        "  workspace_id,\n",
+        "  user,\n",
+        "  genie_surface,\n",
+        "  list_price_per_unit\n",
+        "ORDER BY\n",
+        "  workspace_id,\n",
+        "  user,\n",
+        "  genie_surface"
+      ]
+    },
+    {
+      "name": "genie_usage_daily",
+      "displayName": "genie_usage_daily",
+      "queryLines": [
+        "SELECT\n",
+        "  u.account_id,\n",
+        "  u.workspace_id,\n",
+        "  u.usage_date,\n",
+        "  u.identity_metadata.run_as AS run_as_user,\n",
+        "  u.usage_metadata.genie.surface AS genie_surface,\n",
+        "  u.usage_metadata.genie.channel AS genie_channel,\n",
+        "  u.sku_name,\n",
+        "  SUM(u.usage_quantity) AS dbus,\n",
+        "  SUM(u.usage_quantity * lp.pricing.effective_list.default) AS list_cost\n",
+        "FROM\n",
+        "  system.billing.usage u\n",
+        "    JOIN system.billing.list_prices lp\n",
+        "      ON u.sku_name = lp.sku_name\n",
+        "      AND u.usage_end_time >= lp.price_start_time\n",
+        "      AND (\n",
+        "        lp.price_end_time IS NULL\n",
+        "        OR u.usage_end_time < lp.price_end_time\n",
+        "      )\n",
+        "WHERE\n",
+        "  u.billing_origin_product = 'GENIE'\n",
+        "  AND u.sku_name != 'GENIE_FREE_USAGE'\n",
+        "GROUP BY\n",
+        "  u.account_id,\n",
+        "  u.workspace_id,\n",
+        "  u.usage_date,\n",
+        "  u.identity_metadata.run_as,\n",
+        "  u.usage_metadata.genie.surface,\n",
+        "  u.usage_metadata.genie.channel,\n",
+        "  u.sku_name\n",
+        "ORDER BY\n",
+        "  u.usage_date DESC"
+      ]
+    }
+  ],
+  "pages": [
+    {
+      "name": "d0200390",
+      "displayName": "Page 1",
+      "layout": [
+        {
+          "widget": {
+            "name": "title_header",
+            "multilineTextboxSpec": {
+              "lines": [
+                "## Genie Usage Tracking — Agents, One & Code\n",
+                "Monitoramento de consumo de DBUs e custos por produto Genie (Agents, One & Code), com base nas system tables de billing."
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 12,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "counter_paid_dbus",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_usage_by_user_month",
+                  "fields": [
+                    {
+                      "name": "sum(paid_dbus)",
+                      "expression": "SUM(`paid_dbus`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "frame": {
+                "title": "Total Paid DBUs (mês atual)",
+                "showTitle": true
+              },
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(paid_dbus)",
+                  "rowNumber": 0
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 4,
+            "width": 4,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "counter_list_cost",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_usage_daily",
+                  "fields": [
+                    {
+                      "name": "sum(list_cost)",
+                      "expression": "SUM(`list_cost`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "frame": {
+                "title": "Total Paid List Cost (USD)",
+                "showTitle": true
+              },
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(list_cost)",
+                  "rowNumber": 0
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 4,
+            "width": 4,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "counter_free_cost",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_free_usage_estimated_cost",
+                  "fields": [
+                    {
+                      "name": "sum(total_estimated_list_cost)",
+                      "expression": "SUM(`total_estimated_list_cost`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "frame": {
+                "title": "Estimated Free Usage Cost — 25% promo (USD)",
+                "showTitle": true
+              },
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(total_estimated_list_cost)",
+                  "rowNumber": 0
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 8,
+            "y": 4,
+            "width": 4,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "line_daily_dbus",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_usage_daily",
+                  "fields": [
+                    {
+                      "name": "genie_surface",
+                      "expression": "`genie_surface`"
+                    },
+                    {
+                      "name": "usage_date",
+                      "expression": "`usage_date`"
+                    },
+                    {
+                      "name": "sum(dbus)",
+                      "expression": "SUM(`dbus`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "frame": {
+                "title": "Daily Paid DBUs over Time",
+                "showTitle": true
+              },
+              "widgetType": "line",
+              "encodings": {
+                "x": {
+                  "fieldName": "usage_date",
+                  "scale": {
+                    "type": "temporal"
+                  }
+                },
+                "y": {
+                  "fieldName": "sum(dbus)",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                },
+                "color": {
+                  "fieldName": "genie_surface",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 7,
+            "width": 6,
+            "height": 5
+          }
+        },
+        {
+          "widget": {
+            "name": "bar_dbus_by_surface",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_usage_by_user_month",
+                  "fields": [
+                    {
+                      "name": "genie_surface",
+                      "expression": "`genie_surface`"
+                    },
+                    {
+                      "name": "sum(paid_dbus)",
+                      "expression": "SUM(`paid_dbus`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "frame": {
+                "title": "Paid + Free DBUs by Surface (mês atual)",
+                "showTitle": true
+              },
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "genie_surface",
+                  "displayName": "genie_surface",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                },
+                "y": {
+                  "fieldName": "sum(paid_dbus)",
+                  "displayName": "paid_dbus",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                },
+                "color": {
+                  "fieldName": "genie_surface",
+                  "displayName": "genie_surface",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 12,
+            "width": 6,
+            "height": 5
+          }
+        },
+        {
+          "widget": {
+            "name": "bar_top_users",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_usage_by_user_month",
+                  "fields": [
+                    {
+                      "name": "user",
+                      "expression": "`user`"
+                    },
+                    {
+                      "name": "sum(paid_dbus)",
+                      "expression": "SUM(`paid_dbus`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "frame": {
+                "title": "Top Usuários por Paid DBUs (mês atual)",
+                "showTitle": true
+              },
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "user",
+                  "displayName": "user",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                },
+                "y": {
+                  "fieldName": "sum(paid_dbus)",
+                  "displayName": "paid_dbus",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                },
+                "color": {
+                  "fieldName": "user",
+                  "displayName": "user",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 17,
+            "width": 12,
+            "height": 5
+          }
+        },
+        {
+          "widget": {
+            "name": "table_usage_by_user",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_usage_by_user_month",
+                  "fields": [
+                    {
+                      "name": "user",
+                      "expression": "`user`"
+                    },
+                    {
+                      "name": "genie_surface",
+                      "expression": "`genie_surface`"
+                    },
+                    {
+                      "name": "free_dbus",
+                      "expression": "`free_dbus`"
+                    },
+                    {
+                      "name": "paid_dbus",
+                      "expression": "`paid_dbus`"
+                    },
+                    {
+                      "name": "paid_cost",
+                      "expression": "`paid_cost`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "frame": {
+                "title": "Uso Detalhado por Usuário e Surface",
+                "showTitle": true
+              },
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "user"
+                  },
+                  {
+                    "fieldName": "genie_surface"
+                  },
+                  {
+                    "fieldName": "free_dbus"
+                  },
+                  {
+                    "fieldName": "paid_dbus"
+                  },
+                  {
+                    "fieldName": "paid_cost"
+                  }
+                ]
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 27,
+            "width": 12,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "table_free_cost",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_free_usage_estimated_cost",
+                  "fields": [
+                    {
+                      "name": "workspace_id",
+                      "expression": "`workspace_id`"
+                    },
+                    {
+                      "name": "user",
+                      "expression": "`user`"
+                    },
+                    {
+                      "name": "genie_surface",
+                      "expression": "`genie_surface`"
+                    },
+                    {
+                      "name": "total_dbus",
+                      "expression": "`total_dbus`"
+                    },
+                    {
+                      "name": "list_price_per_unit",
+                      "expression": "`list_price_per_unit`"
+                    },
+                    {
+                      "name": "total_estimated_list_cost",
+                      "expression": "`total_estimated_list_cost`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "frame": {
+                "title": "Custo Estimado de Free Usage por Usuário",
+                "showTitle": true
+              },
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "workspace_id"
+                  },
+                  {
+                    "fieldName": "user"
+                  },
+                  {
+                    "fieldName": "genie_surface"
+                  },
+                  {
+                    "fieldName": "total_dbus"
+                  },
+                  {
+                    "fieldName": "list_price_per_unit"
+                  },
+                  {
+                    "fieldName": "total_estimated_list_cost"
+                  }
+                ]
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 33,
+            "width": 12,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "filter_surface",
+            "queries": [
+              {
+                "name": "dashboards/01f18515006d1340af211011bba55300/datasets/01f1851543f91499833a26509a267004_genie_surface",
+                "query": {
+                  "datasetName": "genie_usage_by_user_month",
+                  "fields": [
+                    {
+                      "name": "genie_surface",
+                      "expression": "`genie_surface`"
+                    },
+                    {
+                      "name": "genie_surface_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "dashboards/01f18515006d1340af211011bba55300/datasets/01f185154429113dad21f477d60ece65_genie_surface",
+                "query": {
+                  "datasetName": "genie_free_usage_estimated_cost",
+                  "fields": [
+                    {
+                      "name": "genie_surface",
+                      "expression": "`genie_surface`"
+                    },
+                    {
+                      "name": "genie_surface_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "dashboards/01f18515006d1340af211011bba55300/datasets/01f185154457152598328e87d77d4f7e_genie_surface",
+                "query": {
+                  "datasetName": "genie_usage_daily",
+                  "fields": [
+                    {
+                      "name": "genie_surface",
+                      "expression": "`genie_surface`"
+                    },
+                    {
+                      "name": "genie_surface_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "frame": {
+                "title": "Produto (Genie Surface)",
+                "showTitle": true
+              },
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "genie_surface",
+                    "queryName": "dashboards/01f18515006d1340af211011bba55300/datasets/01f1851543f91499833a26509a267004_genie_surface"
+                  },
+                  {
+                    "fieldName": "genie_surface",
+                    "queryName": "dashboards/01f18515006d1340af211011bba55300/datasets/01f185154429113dad21f477d60ece65_genie_surface"
+                  },
+                  {
+                    "fieldName": "genie_surface",
+                    "queryName": "dashboards/01f18515006d1340af211011bba55300/datasets/01f185154457152598328e87d77d4f7e_genie_surface"
+                  }
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 4,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "filter_user",
+            "queries": [
+              {
+                "name": "dashboards/01f18515006d1340af211011bba55300/datasets/01f1851543f91499833a26509a267004_user",
+                "query": {
+                  "datasetName": "genie_usage_by_user_month",
+                  "fields": [
+                    {
+                      "name": "user",
+                      "expression": "`user`"
+                    },
+                    {
+                      "name": "user_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "dashboards/01f18515006d1340af211011bba55300/datasets/01f185154429113dad21f477d60ece65_user",
+                "query": {
+                  "datasetName": "genie_free_usage_estimated_cost",
+                  "fields": [
+                    {
+                      "name": "user",
+                      "expression": "`user`"
+                    },
+                    {
+                      "name": "user_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "dashboards/01f18515006d1340af211011bba55300/datasets/01f185154457152598328e87d77d4f7e_run_as_user",
+                "query": {
+                  "datasetName": "genie_usage_daily",
+                  "fields": [
+                    {
+                      "name": "run_as_user",
+                      "expression": "`run_as_user`"
+                    },
+                    {
+                      "name": "run_as_user_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "frame": {
+                "title": "Usuário",
+                "showTitle": true
+              },
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "user",
+                    "queryName": "dashboards/01f18515006d1340af211011bba55300/datasets/01f1851543f91499833a26509a267004_user"
+                  },
+                  {
+                    "fieldName": "user",
+                    "queryName": "dashboards/01f18515006d1340af211011bba55300/datasets/01f185154429113dad21f477d60ece65_user"
+                  },
+                  {
+                    "fieldName": "run_as_user",
+                    "queryName": "dashboards/01f18515006d1340af211011bba55300/datasets/01f185154457152598328e87d77d4f7e_run_as_user"
+                  }
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 2,
+            "width": 8,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "line_daily_cost",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_usage_daily",
+                  "fields": [
+                    {
+                      "name": "genie_surface",
+                      "expression": "`genie_surface`"
+                    },
+                    {
+                      "name": "usage_date",
+                      "expression": "`usage_date`"
+                    },
+                    {
+                      "name": "sum(list_cost)",
+                      "expression": "SUM(`list_cost`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "frame": {
+                "title": "Daily List Cost over Time (USD)",
+                "showTitle": true
+              },
+              "widgetType": "line",
+              "encodings": {
+                "x": {
+                  "fieldName": "usage_date",
+                  "scale": {
+                    "type": "temporal"
+                  }
+                },
+                "y": {
+                  "fieldName": "sum(list_cost)",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                },
+                "color": {
+                  "fieldName": "genie_surface",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 6,
+            "y": 7,
+            "width": 6,
+            "height": 5
+          }
+        },
+        {
+          "widget": {
+            "name": "bar_cost_by_surface",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_usage_by_user_month",
+                  "fields": [
+                    {
+                      "name": "genie_surface",
+                      "expression": "`genie_surface`"
+                    },
+                    {
+                      "name": "sum(paid_cost)",
+                      "expression": "SUM(`paid_cost`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "frame": {
+                "title": "Custo Pago por Surface (USD)",
+                "showTitle": true
+              },
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "genie_surface",
+                  "displayName": "genie_surface",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                },
+                "y": {
+                  "fieldName": "sum(paid_cost)",
+                  "displayName": "paid_cost",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                },
+                "color": {
+                  "fieldName": "genie_surface",
+                  "displayName": "genie_surface",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 6,
+            "y": 12,
+            "width": 6,
+            "height": 5
+          }
+        },
+        {
+          "widget": {
+            "name": "bar_top_users_cost",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "genie_usage_by_user_month",
+                  "fields": [
+                    {
+                      "name": "user",
+                      "expression": "`user`"
+                    },
+                    {
+                      "name": "sum(paid_cost)",
+                      "expression": "SUM(`paid_cost`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "frame": {
+                "title": "Top Usuários por Custo Pago (USD)",
+                "showTitle": true
+              },
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "user",
+                  "displayName": "user",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                },
+                "y": {
+                  "fieldName": "sum(paid_cost)",
+                  "displayName": "paid_cost",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                },
+                "color": {
+                  "fieldName": "user",
+                  "displayName": "user",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 22,
+            "width": 12,
+            "height": 5
+          }
+        }
+      ],
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layoutVersion": "GRID_V1"
+    }
+  ],
+  "uiSettings": {
+    "theme": {
+      "canvasBackgroundColor": {
+        "light": "#FAFAFB",
+        "dark": "#1F272D"
+      },
+      "widgetBackgroundColor": {
+        "light": "#FFFFFF",
+        "dark": "#11171C"
+      },
+      "widgetBorderColor": {
+        "light": "#FFFFFF",
+        "dark": "#11171C"
+      },
+      "fontColor": {
+        "light": "#000000",
+        "dark": "#E8ECF0"
+      },
+      "selectionColor": {
+        "light": "#2272B4",
+        "dark": "#8ACAFF"
+      },
+      "visualizationColors": [
+        "#077A9D",
+        "#FFAB00",
+        "#00A972",
+        "#FF3621",
+        "#8BCAE7",
+        "#AB4057",
+        "#99DDB4",
+        "#FCA4A1",
+        "#919191",
+        "#BF7080",
+        "#077A9D"
+      ],
+      "widgetHeaderAlignment": "CENTER"
+    },
+    "applyModeEnabled": false
+  }
+}
